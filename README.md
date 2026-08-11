@@ -1,1 +1,3 @@
-# fte2
+.DS_Store
+Thumbs.db
+*.log
