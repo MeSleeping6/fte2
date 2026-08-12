@@ -1,0 +1,274 @@
+// js/render.js
+//
+// Pure(ish) rendering: given the current store, rebuilds the SVG scene
+// graph inside the three layer <g> elements. Called on every store
+// change. Trees here are small enough (tens to low hundreds of nodes)
+// that a full rebuild each time is simpler and plenty fast, rather than
+// hand-rolling a diffing renderer.
+
+import { PERSON_RADIUS, pointsToPath } from "./geometry.js";
+import { fullName } from "./model.js";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    node.setAttribute(k, v);
+  }
+  for (const child of children) node.appendChild(child);
+  return node;
+}
+
+function text(str, attrs = {}) {
+  const t = el("text", attrs);
+  t.textContent = str;
+  return t;
+}
+
+export function renderAll(store, els) {
+  renderConnectors(store, els.connectorLayer);
+  renderPeople(store, els.peopleLayer);
+  renderManualDraft(store, els.draftLayer);
+}
+
+// ---- connectors -----------------------------------------------------------
+
+function partnerRowY(store, union) {
+  const ys = union.partnerIds.map((id) => store.getPerson(id).y);
+  return ys.reduce((a, b) => a + b, 0) / ys.length;
+}
+
+function segmentPair(kind, attrs, hitAttrs) {
+  const visible = el("line", { class: `conn conn-${kind}`, ...attrs });
+  const hit = el("line", {
+    class: `conn-hit conn-hit-${kind}`,
+    ...attrs,
+    ...hitAttrs,
+  });
+  return [visible, hit];
+}
+
+function renderConnectors(store, layer) {
+  layer.replaceChildren();
+
+  for (const union of store.allUnions()) {
+    const group = el("g", { "data-union-id": union.id, class: "union-group" });
+    const partners = union.partnerIds.map((id) => store.getPerson(id)).filter(Boolean);
+    if (!partners.length) continue;
+
+    const rowY = partnerRowY(store, union);
+    const isDragged = (kind, childId) =>
+      store.draggingSegment &&
+      store.draggingSegment.unionId === union.id &&
+      store.draggingSegment.kind === kind &&
+      store.draggingSegment.childId === childId;
+
+    // Marriage line between two partners
+    if (partners.length === 2) {
+      const [a, b] = partners;
+      group.appendChild(
+        el("line", {
+          class: "conn conn-marriage",
+          x1: a.x,
+          y1: a.y,
+          x2: b.x,
+          y2: b.y,
+        })
+      );
+    }
+
+    const children = union.childIds.map((id) => store.getPerson(id)).filter(Boolean);
+    const customRoutes = union.customRoutes || {};
+    const autoChildren = children.filter((c) => !customRoutes[c.id]);
+
+    if (autoChildren.length > 0) {
+      const dropY = union.connector.dropY;
+      const parentX = union.connector.parentAnchorX;
+
+      // parent drop (vertical) - draggable horizontally
+      const [pv, ph] = segmentPair(
+        "parentDrop",
+        { x1: parentX, y1: rowY, x2: parentX, y2: dropY },
+        {}
+      );
+      ph.dataset.unionId = union.id;
+      ph.dataset.kind = "parentDrop";
+      ph.dataset.axis = "vertical";
+      if (isDragged("parentDrop")) pv.classList.add("conn-active");
+      group.appendChild(pv);
+      group.appendChild(ph);
+
+      // distribution bar (horizontal) - draggable vertically
+      const anchorXs = [parentX, ...autoChildren.map((c) => union.connector.childAnchors[c.id] ?? c.x)];
+      const barStart = Math.min(...anchorXs);
+      const barEnd = Math.max(...anchorXs);
+      const [bv, bh] = segmentPair(
+        "bar",
+        { x1: barStart, y1: dropY, x2: barEnd, y2: dropY },
+        {}
+      );
+      bh.dataset.unionId = union.id;
+      bh.dataset.kind = "bar";
+      bh.dataset.axis = "horizontal";
+      if (isDragged("bar")) bv.classList.add("conn-active");
+      group.appendChild(bv);
+      group.appendChild(bh);
+
+      // child stubs (vertical) - each draggable horizontally
+      for (const child of autoChildren) {
+        const cx = union.connector.childAnchors[child.id] ?? child.x;
+        const [cv, ch] = segmentPair(
+          "childStub",
+          { x1: cx, y1: dropY, x2: child.x, y2: child.y },
+          {}
+        );
+        ch.dataset.unionId = union.id;
+        ch.dataset.kind = "childStub";
+        ch.dataset.childId = child.id;
+        ch.dataset.axis = "vertical";
+        if (isDragged("childStub", child.id)) cv.classList.add("conn-active");
+        group.appendChild(cv);
+        group.appendChild(ch);
+      }
+    }
+
+    // custom (hand-drawn) routes
+    for (const child of children) {
+      const pts = customRoutes[child.id];
+      if (!pts || pts.length < 2) continue;
+      const d = pointsToPath(pts);
+      group.appendChild(el("path", { class: "conn conn-custom", d, fill: "none" }));
+      const hitPath = el("path", {
+        class: "conn-hit conn-hit-custom",
+        d,
+        fill: "none",
+      });
+      hitPath.dataset.unionId = union.id;
+      hitPath.dataset.kind = "customRoute";
+      hitPath.dataset.childId = child.id;
+      group.appendChild(hitPath);
+    }
+
+    layer.appendChild(group);
+  }
+}
+
+// ---- people -----------------------------------------------------------
+
+function categoryClass(person) {
+  if (person.isPlaceholder) return "cat-placeholder";
+  const known = ["paternal", "maternal", "merge", "collateral"];
+  return known.includes(person.category) ? `cat-${person.category}` : "cat-unset";
+}
+
+function renderLockBadge(px, py) {
+  const g = el("g", {
+    class: "lock-badge",
+    transform: `translate(${px + PERSON_RADIUS - 6}, ${py - PERSON_RADIUS - 2})`,
+  });
+  g.appendChild(el("path", { d: "M -5 0 a 5 5 0 0 1 10 0 v 3 h -10 z", class: "lock-shackle" }));
+  g.appendChild(el("rect", { x: -7, y: 3, width: 14, height: 10, rx: 2, class: "lock-body" }));
+  return g;
+}
+
+function renderPeople(store, layer) {
+  layer.replaceChildren();
+
+  for (const person of store.allPeople()) {
+    const g = el("g", {
+      class: "person" + (person.locked ? " person-locked" : ""),
+      "data-person-id": person.id,
+      transform: `translate(${person.x}, ${person.y})`,
+    });
+
+    if (store.selectedPersonId === person.id) {
+      g.appendChild(
+        el("circle", {
+          class: "person-select-ring",
+          cx: 0,
+          cy: 0,
+          r: PERSON_RADIUS + 6,
+        })
+      );
+    }
+
+    g.appendChild(
+      el("circle", {
+        class: `person-circle ${categoryClass(person)}`,
+        cx: 0,
+        cy: 0,
+        r: PERSON_RADIUS,
+      })
+    );
+
+    if (person.isPlaceholder) {
+      g.appendChild(
+        text("+", {
+          class: "person-plus",
+          x: 0,
+          y: 6,
+          "text-anchor": "middle",
+        })
+      );
+    } else {
+      const name = fullName(person);
+      g.appendChild(
+        text(name, {
+          class: "person-name",
+          x: 0,
+          y: PERSON_RADIUS + 16,
+          "text-anchor": "middle",
+        })
+      );
+      (person.notes || []).forEach((line, i) => {
+        if (!line) return;
+        g.appendChild(
+          text(line, {
+            class: "person-note",
+            x: 0,
+            y: PERSON_RADIUS + 29 + i * 13,
+            "text-anchor": "middle",
+          })
+        );
+      });
+    }
+
+    layer.appendChild(g);
+    if (person.locked) layer.appendChild(renderLockBadge(person.x, person.y));
+  }
+}
+
+// ---- manual line draft overlay -----------------------------------------
+
+function renderManualDraft(store, layer) {
+  layer.replaceChildren();
+  const draft = store.manualLineDraft;
+  if (!draft) return;
+
+  if (draft.points.length >= 2) {
+    layer.appendChild(
+      el("path", {
+        class: "conn-draft",
+        d: pointsToPath(draft.points),
+        fill: "none",
+      })
+    );
+  }
+  for (const [x, y] of draft.points) {
+    layer.appendChild(el("circle", { class: "draft-point", cx: x, cy: y, r: 4 }));
+  }
+  if (draft.cursor && draft.points.length) {
+    const last = draft.points[draft.points.length - 1];
+    layer.appendChild(
+      el("line", {
+        class: "conn-draft-preview",
+        x1: last[0],
+        y1: last[1],
+        x2: draft.cursor[0],
+        y2: draft.cursor[1],
+      })
+    );
+  }
+}

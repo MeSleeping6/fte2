@@ -1,0 +1,210 @@
+// js/state.js
+//
+// Single source of truth for the whole app. Holds the people/unions data,
+// current selection, viewport (pan/zoom), interaction mode, and an
+// undo/redo history of full-state snapshots.
+//
+// Snapshot-based undo/redo is deliberately simple rather than clever: for
+// a tree of a few hundred people, cloning the whole {people, unions}
+// object on every edit costs nothing noticeable, and it sidesteps an
+// entire class of "forgot to write the inverse of this operation" bugs
+// that a command-pattern undo stack is prone to.
+
+const HISTORY_LIMIT = 200;
+
+/** @typedef {import('./types').Person} Person */
+/** @typedef {import('./types').Union} Union */
+
+class Store {
+  constructor() {
+    /** @type {Map<string, Person>} */
+    this.people = new Map();
+    /** @type {Map<string, Union>} */
+    this.unions = new Map();
+
+    this.selectedPersonId = null;
+    this.hoveredSegment = null; // { unionId, kind: 'bar'|'parentDrop'|'childStub', childId? }
+    this.draggingSegment = null;
+
+    this.viewport = { x: 0, y: 0, zoom: 1 };
+
+    this.mode = "normal"; // 'normal' | 'manual-line' | 'pan'
+    this.manualLineDraft = null; // { unionId, childId, points: [[x,y], ...] }
+    this.manualLineSnap = true;
+
+    this.showMinimap = true;
+
+    this._undoStack = [];
+    this._redoStack = [];
+
+    /** @type {Set<Function>} */
+    this._listeners = new Set();
+    this._idCounter = 1;
+  }
+
+  // ---- bootstrapping ----------------------------------------------------
+
+  load(people, unions) {
+    this.people = new Map(people.map((p) => [p.id, cloneDeep(p)]));
+    this.unions = new Map(unions.map((u) => [u.id, cloneDeep(u)]));
+    this._undoStack = [];
+    this._redoStack = [];
+    this.selectedPersonId = null;
+    this.notify();
+  }
+
+  // ---- subscriptions ------------------------------------------------------
+
+  subscribe(fn) {
+    this._listeners.add(fn);
+    return () => this._listeners.delete(fn);
+  }
+
+  notify() {
+    for (const fn of this._listeners) fn(this);
+  }
+
+  // ---- id generation --------------------------------------------------
+
+  newId(prefix) {
+    let id;
+    do {
+      id = `${prefix}-${Date.now().toString(36)}-${(this._idCounter++).toString(36)}`;
+    } while (this.people.has(id) || this.unions.has(id));
+    return id;
+  }
+
+  // ---- snapshot / undo / redo ------------------------------------------
+
+  _snapshot() {
+    return {
+      people: cloneDeep([...this.people.values()]),
+      unions: cloneDeep([...this.unions.values()]),
+    };
+  }
+
+  _restore(snap) {
+    this.people = new Map(snap.people.map((p) => [p.id, p]));
+    this.unions = new Map(snap.unions.map((u) => [u.id, u]));
+  }
+
+  /**
+   * Run a mutation, recording undo history around it. Every model.js
+   * function that changes data should be called through this.
+   * @param {(store: Store) => void} mutator
+   */
+  change(mutator) {
+    const before = this._snapshot();
+    mutator(this);
+    this._undoStack.push(before);
+    if (this._undoStack.length > HISTORY_LIMIT) this._undoStack.shift();
+    this._redoStack = [];
+    this.notify();
+  }
+
+  // ---- live edits (dragging) --------------------------------------------
+  //
+  // Continuous gestures (dragging a person or a connector segment) mutate
+  // state directly on every pointermove for a smooth live preview, without
+  // pushing an undo entry per pixel. beginLiveEdit()/commitLiveEdit() wrap
+  // the whole gesture as a single undo step instead.
+
+  beginLiveEdit() {
+    return this._snapshot();
+  }
+
+  commitLiveEdit(beforeSnapshot) {
+    this._undoStack.push(beforeSnapshot);
+    if (this._undoStack.length > HISTORY_LIMIT) this._undoStack.shift();
+    this._redoStack = [];
+    this.notify();
+  }
+
+  cancelLiveEdit(beforeSnapshot) {
+    this._restore(beforeSnapshot);
+    this.notify();
+  }
+
+  canUndo() {
+    return this._undoStack.length > 0;
+  }
+
+  canRedo() {
+    return this._redoStack.length > 0;
+  }
+
+  undo() {
+    if (!this.canUndo()) return;
+    const current = this._snapshot();
+    const prev = this._undoStack.pop();
+    this._redoStack.push(current);
+    this._restore(prev);
+    if (this.selectedPersonId && !this.people.has(this.selectedPersonId)) {
+      this.selectedPersonId = null;
+    }
+    this.notify();
+  }
+
+  redo() {
+    if (!this.canRedo()) return;
+    const current = this._snapshot();
+    const next = this._redoStack.pop();
+    this._undoStack.push(current);
+    this._restore(next);
+    if (this.selectedPersonId && !this.people.has(this.selectedPersonId)) {
+      this.selectedPersonId = null;
+    }
+    this.notify();
+  }
+
+  // ---- convenience getters --------------------------------------------
+
+  getPerson(id) {
+    return this.people.get(id) || null;
+  }
+
+  getUnion(id) {
+    return this.unions.get(id) || null;
+  }
+
+  allPeople() {
+    return [...this.people.values()];
+  }
+
+  allUnions() {
+    return [...this.unions.values()];
+  }
+
+  /** Unions in which this person appears as a partner. */
+  unionsAsPartner(personId) {
+    return this.allUnions().filter((u) => u.partnerIds.includes(personId));
+  }
+
+  /** The single union (if any) in which this person appears as a child. */
+  unionAsChild(personId) {
+    return this.allUnions().find((u) => u.childIds.includes(personId)) || null;
+  }
+
+  siblingsOf(personId) {
+    const union = this.unionAsChild(personId);
+    if (!union) return [];
+    return union.childIds.filter((id) => id !== personId);
+  }
+
+  select(personId) {
+    this.selectedPersonId = personId;
+    this.notify();
+  }
+
+  clearSelection() {
+    this.selectedPersonId = null;
+    this.notify();
+  }
+}
+
+export function cloneDeep(value) {
+  if (typeof structuredClone === "function") return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+export const store = new Store();
